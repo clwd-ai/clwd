@@ -7,6 +7,8 @@ from typing import Optional
 import click
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.prompt import Prompt
+from rich.table import Table
 
 from clwd import __version__
 from clwd.utils.config import Config, ProjectNotFoundError, ProjectExistsError
@@ -17,6 +19,65 @@ from clwd.providers import ProviderError
 
 
 console = Console()
+
+
+def interactive_project_selection(config: Config, action: str = "select", filter_running: bool = False) -> Optional[str]:
+    """Interactive project selection with rich display."""
+    try:
+        projects = config.list_projects()
+        if not projects:
+            console.print("[yellow]No projects found.[/yellow]")
+            console.print("Create one with: [cyan]clwd init myproject[/cyan]")
+            return None
+        
+        # Filter running projects if requested
+        if filter_running:
+            # This would require checking actual project status
+            # For now, we'll show all projects
+            pass
+        
+        # Create a table for display
+        table = Table(show_header=True, header_style="bold blue")
+        table.add_column("#", style="dim", width=3)
+        table.add_column("Name", style="cyan")
+        table.add_column("IP Address", style="green")
+        table.add_column("Provider", style="magenta") 
+        table.add_column("Created", style="dim")
+        
+        project_list = []
+        for i, (name, project) in enumerate(projects.items(), 1):
+            table.add_row(
+                str(i),
+                name,
+                project.get('ip', 'N/A'),
+                project.get('provider', 'N/A'),
+                project.get('created_at', 'N/A')[:10] if project.get('created_at') else 'N/A'
+            )
+            project_list.append(name)
+        
+        console.print(f"\n[bold]Select a project to {action}:[/bold]")
+        console.print(table)
+        
+        # Simple numbered selection (Rich doesn't have built-in arrow key navigation)
+        while True:
+            try:
+                choice = Prompt.ask(
+                    "\nEnter project number (or 'q' to quit)",
+                    choices=[str(i) for i in range(1, len(project_list) + 1)] + ['q'],
+                    show_choices=False
+                )
+                
+                if choice == 'q':
+                    return None
+                    
+                return project_list[int(choice) - 1]
+                
+            except (ValueError, IndexError):
+                console.print("[red]Invalid selection. Try again.[/red]")
+                
+    except Exception as e:
+        console.print(f"[red]Error loading projects: {e}[/red]")
+        return None
 
 
 @click.group()
@@ -38,23 +99,27 @@ def cli(ctx: click.Context, debug: bool) -> None:
 
 
 @cli.command()
-@click.option("--name", required=True, help="Project name")
+@click.argument("name", required=False)
+@click.option("--name", help="Project name (alternative to positional argument)")
 @click.option("--provider", default="hetzner", help="Cloud provider (hetzner)")
 @click.option("--size", default="small", help="Instance size (small, medium, large)")
 @click.option("--hardening", default="none", help="Security hardening level (none, minimal, full)")
 @click.option("--region", help="Cloud provider region")
 @click.option("--premium", is_flag=True, help="Use premium service for faster provisioning")
 @click.option("--skip-auth", is_flag=True, help="Skip Claude Code authentication transfer")
+@click.option("--standard", is_flag=True, help="Force standard provisioning (bypass premium)")
 @click.pass_context
 def init(
     ctx: click.Context,
-    name: str,
+    name: Optional[str],
     provider: str,
     size: str,
     hardening: str,
     region: Optional[str],
     premium: bool,
     skip_auth: bool,
+    standard: bool,
+    **kwargs
 ) -> None:
     """Initialize a new cloud instance with Claude Code.
     
@@ -64,20 +129,27 @@ def init(
     config = ctx.obj["config"]
     debug = ctx.obj.get("debug", False)
     
-    # Check if project already exists
-    if config.project_exists(name):
-        console.print(f"[red]✗ Project '{name}' already exists![/red]")
-        console.print(f"Use 'clwd status --name {name}' to check its status")
+    # Resolve project name (positional argument takes precedence over --name option)
+    project_name = name or kwargs.get('name')
+    if not project_name:
+        console.print("[red]✗ Project name is required[/red]")
+        console.print("Usage: [cyan]clwd init myproject[/cyan] or [cyan]clwd init --name myproject[/cyan]")
         sys.exit(1)
     
-    console.print(f"[bold]Creating cloud instance for project: {name}[/bold]")
+    # Check if project already exists
+    if config.project_exists(project_name):
+        console.print(f"[red]✗ Project '{project_name}' already exists![/red]")
+        console.print(f"Use 'clwd status {project_name}' to check its status")
+        sys.exit(1)
+    
+    console.print(f"[bold]Creating cloud instance for project: {project_name}[/bold]")
     
     if premium:
         console.print("[yellow]Premium service is not yet available. Using standard provisioning.[/yellow]")
     
     # Run async initialization
     try:
-        asyncio.run(_init_async(ctx, name, provider, size, hardening, region, skip_auth))
+        asyncio.run(_init_async(ctx, project_name, provider, size, hardening, region, skip_auth))
     except KeyboardInterrupt:
         console.print("\n[yellow]Operation cancelled by user[/yellow]")
         sys.exit(1)
@@ -375,10 +447,11 @@ def status(ctx: click.Context, name: str) -> None:
 
 
 @cli.command()
-@click.option("--name", required=True, help="Project name")
+@click.argument("name", required=False)
+@click.option("--name", help="Project name (alternative to positional argument)")
 @click.option("--force", is_flag=True, help="Skip confirmation prompt")
 @click.pass_context
-def destroy(ctx: click.Context, name: str, force: bool) -> None:
+def destroy(ctx: click.Context, name: Optional[str], force: bool, **kwargs) -> None:
     """Destroy a cloud instance.
     
     Permanently destroys the specified cloud instance and removes all data.
@@ -387,29 +460,37 @@ def destroy(ctx: click.Context, name: str, force: bool) -> None:
     config = ctx.obj["config"]
     debug = ctx.obj.get("debug", False)
     
+    # Resolve project name (positional argument takes precedence over --name option)
+    project_name = name or kwargs.get('name')
+    if not project_name:
+        # Show interactive selection
+        project_name = interactive_project_selection(config, "destroy")
+        if not project_name:
+            sys.exit(0)  # User cancelled or no projects
+    
     try:
         # Get project from config
-        instance = config.get_project_instance(name)
+        instance = config.get_project_instance(project_name)
         if not instance:
-            console.print(f"[red]✗ Project '{name}' not found[/red]")
+            console.print(f"[red]✗ Project '{project_name}' not found[/red]")
             sys.exit(1)
         
         # Confirm destruction
         if not force:
             console.print(f"[yellow]About to destroy:[/yellow]")
-            console.print(f"  Project: {name}")
+            console.print(f"  Project: {project_name}")
             console.print(f"  Instance ID: {instance.id}")
             console.print(f"  IP Address: {instance.ip}")
             console.print(f"  Provider: {instance.provider}")
             
-            if not click.confirm(f"\nAre you sure you want to destroy project '{name}'?"):
+            if not click.confirm(f"\nAre you sure you want to destroy project '{project_name}'?"):
                 console.print("[yellow]Operation cancelled.[/yellow]")
                 return
         
-        console.print(f"[bold red]Destroying project: {name}[/bold red]")
+        console.print(f"[bold red]Destroying project: {project_name}[/bold red]")
         
         # Run async destruction
-        asyncio.run(_destroy_async(ctx, name, instance))
+        asyncio.run(_destroy_async(ctx, project_name, instance))
         
     except Exception as e:
         console.print(f"[red]✗ Error destroying project: {e}[/red]")
