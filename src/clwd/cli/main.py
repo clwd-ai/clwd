@@ -10,6 +10,8 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from clwd import __version__
 from clwd.utils.config import Config, ProjectNotFoundError, ProjectExistsError
+from clwd.utils.ssh import ssh_manager, SSHError
+from clwd.utils.keychain import get_claude_authentication, validate_claude_authentication, KeychainError
 from clwd.providers.hetzner import HetznerProvider
 from clwd.providers import ProviderError
 
@@ -88,34 +90,216 @@ def init(
 
 @cli.command()
 @click.option("--name", required=True, help="Project name")
+@click.option("--user", default="claude-user", help="SSH user (default: claude-user)")
 @click.pass_context
-def open(ctx: click.Context, name: str) -> None:
-    """Open an interactive SSH session with the cloud instance.
+def ssh(ctx: click.Context, name: str, user: str) -> None:
+    """Open a plain SSH session to the cloud instance.
     
-    Connects to the specified project instance and starts an interactive
-    SSH session with Claude Code available in the /app directory.
+    Connects to the cloud instance with a standard SSH session for 
+    debugging, administration, or direct shell access.
     """
-    console.print(f"[bold]Opening interactive session for project: {name}[/bold]")
+    config = ctx.obj["config"]
+    debug = ctx.obj.get("debug", False)
     
-    # TODO: Implement interactive SSH session
-    console.print("[red]Command not yet implemented in this version.[/red]")
+    try:
+        # Get project from config
+        instance = config.get_project_instance(name)
+        if not instance:
+            console.print(f"[red]✗ Project '{name}' not found[/red]")
+            console.print("Use 'clwd config list' to see all projects")
+            sys.exit(1)
+        
+        console.print(f"[bold]Opening SSH session for project: {name}[/bold]")
+        console.print(f"[dim]Connecting to {user}@{instance.ip}...[/dim]")
+        
+        # Get SSH session
+        ssh_session = ssh_manager.get_session(instance.ip, user)
+        
+        # Test connection first
+        if not ssh_session.test_connection(timeout=10):
+            console.print(f"[red]✗ Cannot connect to {instance.ip}[/red]")
+            console.print("[dim]Make sure the instance is running and SSH is available[/dim]")
+            sys.exit(1)
+        
+        # Start plain SSH session
+        console.print("[dim]Starting SSH session... (press Ctrl+C or 'exit' to quit)[/dim]\n")
+        
+        exit_code = ssh_session.execute_interactive()
+        
+        if exit_code == 0:
+            console.print("\n[green]✓ SSH session ended normally[/green]")
+        elif exit_code == 130:
+            console.print("\n[yellow]SSH session interrupted by user[/yellow]")
+        else:
+            console.print(f"\n[yellow]SSH session ended with exit code {exit_code}[/yellow]")
+            
+    except SSHError as e:
+        console.print(f"[red]✗ SSH error: {e}[/red]")
+        if debug:
+            console.print_exception()
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]✗ Error opening session: {e}[/red]")
+        if debug:
+            console.print_exception()
+        sys.exit(1)
 
 
 @cli.command()
 @click.option("--name", required=True, help="Project name")
-@click.argument("command", required=True)
-@click.option("--timeout", default=120, help="Command timeout in seconds")
 @click.pass_context
-def exec(ctx: click.Context, name: str, command: str, timeout: int) -> None:
-    """Execute a command on the cloud instance.
+def open(ctx: click.Context, name: str) -> None:
+    """Open an interactive Claude Code session on the cloud instance.
     
-    Runs the specified command on the cloud instance and returns the output.
-    Useful for running scripts, builds, or other automated tasks.
+    Connects to the cloud instance and starts Claude Code in interactive mode
+    in the /app directory, ready for development and conversation.
     """
-    console.print(f"[bold]Executing command on {name}:[/bold] {command}")
+    config = ctx.obj["config"]
+    debug = ctx.obj.get("debug", False)
     
-    # TODO: Implement command execution
-    console.print("[red]Command not yet implemented in this version.[/red]")
+    try:
+        # Get project from config
+        instance = config.get_project_instance(name)
+        if not instance:
+            console.print(f"[red]✗ Project '{name}' not found[/red]")
+            console.print("Use 'clwd config list' to see all projects")
+            sys.exit(1)
+        
+        console.print(f"[bold]Opening Claude Code interactive session for project: {name}[/bold]")
+        console.print(f"[dim]Connecting to claude-user@{instance.ip}...[/dim]")
+        
+        # Get SSH session for claude-user
+        ssh_session = ssh_manager.get_session(instance.ip, "claude-user")
+        
+        # Test connection first
+        if not ssh_session.test_connection(timeout=10):
+            console.print(f"[red]✗ Cannot connect to {instance.ip}[/red]")
+            console.print("[dim]Make sure the instance is running and SSH is available[/dim]")
+            sys.exit(1)
+        
+        # Check if setup is complete (optional warning)
+        try:
+            return_code, _, _ = ssh_session.execute_command("test -f /tmp/clwd-setup-complete", timeout=5)
+            if return_code != 0:
+                console.print("[yellow]⚠ Instance setup may not be complete yet[/yellow]")
+                console.print("[dim]Some services may still be starting up[/dim]")
+        except SSHError:
+            pass  # Setup check is optional
+        
+        # Start Claude Code interactive session
+        console.print("[dim]Starting Claude Code session... (press Ctrl+C to exit)[/dim]\n")
+        
+        # Start Claude Code in the /app directory
+        claude_command = "cd /app && claude"
+        exit_code = ssh_session.execute_interactive(claude_command)
+        
+        if exit_code == 0:
+            console.print("\n[green]✓ Claude Code session ended normally[/green]")
+        elif exit_code == 130:
+            console.print("\n[yellow]Claude Code session interrupted by user[/yellow]")
+        else:
+            console.print(f"\n[yellow]Claude Code session ended with exit code {exit_code}[/yellow]")
+        
+        # Show helpful next steps
+        console.print(f"\n[bold]Next steps:[/bold]")
+        console.print(f"  clwd open --name {name}                    # Reconnect to Claude Code")
+        console.print(f"  clwd exec --name {name} 'your instruction' # Run headless instruction") 
+        console.print(f"[dim]Preview URL: http://{instance.ip}[/dim]")
+            
+    except SSHError as e:
+        console.print(f"[red]✗ SSH error: {e}[/red]")
+        if debug:
+            console.print_exception()
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]✗ Error opening session: {e}[/red]")
+        if debug:
+            console.print_exception()
+        sys.exit(1)
+
+
+@cli.command()
+@click.option("--name", required=True, help="Project name")
+@click.argument("instruction", required=True)
+@click.option("--timeout", default=300, help="Command timeout in seconds (default: 5 minutes)")
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose output from Claude Code")
+@click.pass_context
+def exec(ctx: click.Context, name: str, instruction: str, timeout: int, verbose: bool) -> None:
+    """Execute a Claude Code instruction on the remote instance.
+    
+    Sends an instruction to Claude Code running on the cloud instance in headless mode.
+    Examples:
+      clwd exec --name myproject "create a login form with validation"
+      clwd exec --name myproject "add error handling to the API routes"
+      clwd exec --name myproject "refactor the database connection code"
+    """
+    config = ctx.obj["config"]
+    debug = ctx.obj.get("debug", False)
+    
+    try:
+        # Get project from config
+        instance = config.get_project_instance(name)
+        if not instance:
+            console.print(f"[red]✗ Project '{name}' not found[/red]")
+            console.print("Use 'clwd config list' to see all projects")
+            sys.exit(1)
+        
+        console.print(f"[bold]Executing Claude Code instruction on {name}:[/bold] {instruction}")
+        console.print(f"[dim]Connecting to claude-user@{instance.ip}...[/dim]")
+        
+        # Get SSH session for claude-user (not root)
+        ssh_session = ssh_manager.get_session(instance.ip, "claude-user")
+        
+        # Test connection first
+        if not ssh_session.test_connection(timeout=10):
+            console.print(f"[red]✗ Cannot connect to {instance.ip}[/red]")
+            console.print("[dim]Make sure the instance is running and Claude Code is set up[/dim]")
+            sys.exit(1)
+        
+        # Build Claude Code command
+        verbose_flag = "--verbose" if verbose else ""
+        claude_command = f"cd /app && claude -p --dangerously-skip-permissions {verbose_flag} '{instruction}'"
+        
+        if debug:
+            console.print(f"[dim]Remote command: {claude_command}[/dim]")
+        
+        console.print("[dim]Running Claude Code in headless mode...[/dim]")
+        console.print("[dim]This may take a few minutes for complex instructions[/dim]")
+        
+        # Execute Claude Code command with longer timeout
+        return_code, stdout, stderr = ssh_session.execute_command(
+            claude_command, 
+            timeout=timeout,
+            capture_output=True
+        )
+        
+        # Show output
+        if stdout.strip():
+            console.print("\n[bold]Claude Code Output:[/bold]")
+            console.print(stdout.strip())
+        
+        if stderr.strip():
+            console.print("\n[bold]Error Output:[/bold]")
+            console.print(f"[red]{stderr.strip()}[/red]")
+        
+        # Show result
+        if return_code == 0:
+            console.print(f"\n[green]✓ Claude Code instruction completed successfully[/green]")
+            console.print(f"[dim]Preview changes: http://{instance.ip}[/dim]")
+        else:
+            console.print(f"\n[red]✗ Claude Code instruction failed (exit code: {return_code})[/red]")
+            sys.exit(return_code)
+            
+    except SSHError as e:
+        console.print(f"[red]✗ SSH error: {e}[/red]")
+        if debug:
+            console.print_exception()
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]✗ Error executing instruction: {e}[/red]")
+        if debug:
+            console.print_exception()
+        sys.exit(1)
 
 
 @cli.command()
@@ -164,11 +348,24 @@ def status(ctx: click.Context, name: str) -> None:
         console.print(f"\n[bold]Preview URL:[/bold] http://{instance.ip}")
         console.print(f"[bold]SSH Command:[/bold] ssh root@{instance.ip}")
         
-        # TODO: Get live status from provider
-        # For now, just show stored status
+        # Test SSH connection if requested
         if debug:
-            console.print(f"\n[dim]Stored status: {instance.status}[/dim]")
-            console.print("[dim]Note: Use provider API to get live status[/dim]")
+            console.print("\n[dim]Testing SSH connection...[/dim]")
+            ssh_session = ssh_manager.get_session(instance.ip)
+            ssh_info = ssh_session.get_instance_info()
+            
+            if ssh_info["connection_available"]:
+                console.print("[dim]✓ SSH connection available[/dim]")
+                if ssh_info["setup_complete"]:
+                    console.print("[dim]✓ Instance setup complete[/dim]")
+                else:
+                    console.print("[dim]⚠ Instance setup may still be in progress[/dim]")
+            else:
+                console.print("[dim]✗ SSH connection not available[/dim]")
+        
+        console.print(f"\n[bold]Next steps:[/bold]")
+        console.print(f"  clwd open --name {name}      # Open interactive session")
+        console.print(f"  clwd exec --name {name} 'ls' # Execute command")
             
     except Exception as e:
         console.print(f"[red]✗ Error checking status: {e}[/red]")
@@ -205,7 +402,7 @@ def destroy(ctx: click.Context, name: str, force: bool) -> None:
             console.print(f"  IP Address: {instance.ip}")
             console.print(f"  Provider: {instance.provider}")
             
-            if not click.confirm(f"\n[bold red]Are you sure you want to destroy project '{name}'?[/bold red]"):
+            if not click.confirm(f"\nAre you sure you want to destroy project '{name}'?"):
                 console.print("[yellow]Operation cancelled.[/yellow]")
                 return
         
@@ -326,6 +523,62 @@ def premium_login(ctx: click.Context) -> None:
     console.print("[yellow]Premium service is not yet available.[/yellow]")
 
 
+@cli.command()
+@click.option("--name", required=True, help="Project name")
+@click.pass_context
+def auth(ctx: click.Context, name: str) -> None:
+    """Authenticate Claude Code on the remote instance.
+    
+    Opens an interactive session to run 'claude auth login' on the instance.
+    Useful when automatic authentication failed or credentials expired.
+    """
+    config = ctx.obj["config"]
+    debug = ctx.obj.get("debug", False)
+    
+    try:
+        # Get project from config
+        instance = config.get_project_instance(name)
+        if not instance:
+            console.print(f"[red]✗ Project '{name}' not found[/red]")
+            console.print("Use 'clwd config list' to see all projects")
+            sys.exit(1)
+        
+        console.print(f"[bold]Authenticating Claude Code on '{name}'...[/bold]")
+        console.print(f"[dim]This will open an interactive session to run 'claude auth login'[/dim]")
+        
+        # Get SSH session for claude-user
+        ssh_session = ssh_manager.get_session(instance.ip, "claude-user")
+        
+        # Test connection first
+        if not ssh_session.test_connection(timeout=10):
+            console.print(f"[red]✗ Cannot connect to {instance.ip}[/red]")
+            console.print("[dim]Make sure the instance is running[/dim]")
+            sys.exit(1)
+        
+        # Start auth session
+        console.print("[dim]Starting authentication session...[/dim]\n")
+        
+        auth_command = "cd /app && claude auth login"
+        exit_code = ssh_session.execute_interactive(auth_command)
+        
+        if exit_code == 0:
+            console.print("\n[green]✓ Authentication completed[/green]")
+            console.print(f"[dim]You can now use: clwd open --name {name}[/dim]")
+        else:
+            console.print(f"\n[yellow]Authentication session ended with exit code {exit_code}[/yellow]")
+            
+    except SSHError as e:
+        console.print(f"[red]✗ SSH error: {e}[/red]")
+        if debug:
+            console.print_exception()
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]✗ Error during authentication: {e}[/red]")
+        if debug:
+            console.print_exception()
+        sys.exit(1)
+
+
 async def _init_async(
     ctx: click.Context,
     name: str,
@@ -355,20 +608,47 @@ async def _init_async(
             else:
                 raise ValueError(f"Unsupported provider: {provider}")
             
-            # TODO: Handle Claude authentication (skip for now if skip_auth)
+            # Prepare Claude authentication data
+            credentials_json = None
+            session_json = None  
             claude_json_content = None
+            
             if not skip_auth:
                 progress.update(task, description="Preparing Claude Code authentication...")
-                # TODO: Implement keychain integration
-                await asyncio.sleep(1)
+                
+                try:
+                    credentials_json, session_json = get_claude_authentication()
+                    
+                    # Follow prototype's fail-fast approach - require keychain credentials
+                    if not credentials_json:
+                        console.print("[red]✗ No Claude Code credentials found in Keychain![/red]")
+                        console.print("[dim]Please authenticate Claude Code locally first:[/dim]")
+                        console.print("[dim]  1. Run: claude auth login[/dim]")
+                        console.print(f"[dim]  2. Then retry: clwd init --name {name}[/dim]")
+                        console.print(f"[dim]  3. Or use: clwd init --name {name} --skip-auth[/dim]")
+                        sys.exit(1)
+                    
+                    # Validate that we have session data too
+                    if not session_json:
+                        console.print("[red]✗ No Claude Code session file found![/red]")
+                        console.print("[dim]Please ensure ~/.claude.json exists (run claude locally first)[/dim]")
+                        sys.exit(1)
+                    
+                    # Skip cloud-init session data - we'll copy everything via SSH after cloud-init
+                    console.print("[green]✓[/green] Claude Code authentication prepared for SSH transfer")
+                        
+                except Exception as e:
+                    console.print(f"[red]✗ Could not prepare authentication: {e}[/red]")
+                    console.print("[dim]Please ensure Claude Code is authenticated locally[/dim]")
+                    sys.exit(1)
             
-            # Create cloud instance
+            # Create cloud instance (no Claude session data in cloud-init)
             progress.update(task, description="Creating cloud instance...")
             instance = await cloud_provider.create_instance(
                 name=name,
                 size=size,
                 hardening_level=hardening,
-                claude_json_content=claude_json_content
+                claude_json_content=None
             )
             
             # Wait for SSH to be available
@@ -382,9 +662,86 @@ async def _init_async(
             progress.update(task, description="Saving project configuration...")
             config.add_project(name, instance)
             
-            # Final setup validation
-            progress.update(task, description="Validating setup...")
-            await asyncio.sleep(2)  # Allow time for cloud-init to complete
+            # Wait for instance to be fully provisioned
+            progress.update(task, description="Waiting for instance to be fully provisioned...")
+            ssh_session = ssh_manager.get_session(instance.ip, "root")
+            setup_complete = ssh_session.wait_for_setup_complete(timeout=300)
+
+            if not setup_complete:
+                raise ProviderError("Instance setup did not complete after 5 minutes")
+            
+            # Copy Claude Code authentication after setup is complete
+            if not skip_auth and credentials_json:
+                progress.update(task, description="Copying Claude Code credentials...")
+                
+                try:
+                    # Clear any cached sessions to ensure fresh connection
+                    ssh_manager.clear_all_sessions()
+                    
+                    # Brief delay to ensure SSH daemon is fully ready
+                    await asyncio.sleep(3)
+                    
+                    ssh_session = ssh_manager.get_session(instance.ip, "claude-user")
+                    
+                    # Test connection first before proceeding
+                    if not ssh_session.test_connection(timeout=10):
+                        raise Exception("SSH connection test failed")
+                    
+                    # Create .claude directory
+                    ssh_session.execute_command("mkdir -p ~/.claude", timeout=30)
+                    
+                    # Copy .credentials.json from keychain
+                    import tempfile
+                    import os
+                    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as temp_creds:
+                        temp_creds.write(credentials_json)
+                        temp_creds_path = temp_creds.name
+                    
+                    try:
+                        if ssh_session.copy_file_to_remote(temp_creds_path, "~/.claude/.credentials.json"):
+                            console.print("[green]✓[/green] Keychain credentials copied")
+                        else:
+                            console.print("[yellow]⚠[/yellow] Could not copy keychain credentials")
+                    finally:
+                        os.unlink(temp_creds_path)
+                    
+                    # Copy full .claude.json content (from session_json)
+                    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as temp_session:
+                        temp_session.write(session_json)
+                        temp_session_path = temp_session.name
+                    
+                    try:
+                        if ssh_session.copy_file_to_remote(temp_session_path, "~/.claude.json"):
+                            console.print("[green]✓[/green] Full Claude session copied")
+                        else:
+                            console.print("[yellow]⚠[/yellow] Could not copy Claude session file")
+                    finally:
+                        os.unlink(temp_session_path)
+                    
+                    # Create settings.json
+                    settings_content = """{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "defaultMode": "acceptEdits"
+  },
+  "theme": "dark",
+  "autoUpdates": false
+}"""
+                    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as temp_settings:
+                        temp_settings.write(settings_content)
+                        temp_settings_path = temp_settings.name
+                    
+                    try:
+                        if ssh_session.copy_file_to_remote(temp_settings_path, "~/.claude/settings.json"):
+                            console.print("[green]✓[/green] Claude Code settings configured")
+                        else:
+                            console.print("[yellow]⚠[/yellow] Could not copy settings file")
+                    finally:
+                        os.unlink(temp_settings_path)
+                        
+                except Exception as e:
+                    console.print(f"[yellow]⚠[/yellow] Could not copy credentials via SSH: {e}")
+                    console.print(f"[dim]You can authenticate manually with: clwd auth --name {name}[/dim]")
             
         except ProviderError as e:
             raise RuntimeError(f"Provider error: {e}")
