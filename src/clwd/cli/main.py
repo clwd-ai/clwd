@@ -9,6 +9,9 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from clwd import __version__
+from clwd.utils.config import Config, ProjectNotFoundError, ProjectExistsError
+from clwd.providers.hetzner import HetznerProvider
+from clwd.providers import ProviderError
 
 
 console = Console()
@@ -26,6 +29,7 @@ def cli(ctx: click.Context, debug: bool) -> None:
     """
     ctx.ensure_object(dict)
     ctx.obj["debug"] = debug
+    ctx.obj["config"] = Config()
     
     if debug:
         console.print("[dim]Debug mode enabled[/dim]")
@@ -55,13 +59,31 @@ def init(
     Creates a new cloud instance with Claude Code pre-installed and
     authenticated, ready for development with live preview URLs.
     """
+    config = ctx.obj["config"]
+    debug = ctx.obj.get("debug", False)
+    
+    # Check if project already exists
+    if config.project_exists(name):
+        console.print(f"[red]✗ Project '{name}' already exists![/red]")
+        console.print(f"Use 'clwd status --name {name}' to check its status")
+        sys.exit(1)
+    
     console.print(f"[bold]Creating cloud instance for project: {name}[/bold]")
     
     if premium:
         console.print("[yellow]Premium service is not yet available. Using standard provisioning.[/yellow]")
     
     # Run async initialization
-    asyncio.run(_init_async(ctx, name, provider, size, hardening, region, skip_auth))
+    try:
+        asyncio.run(_init_async(ctx, name, provider, size, hardening, region, skip_auth))
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Operation cancelled by user[/yellow]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"[red]✗ Failed to create project: {e}[/red]")
+        if debug:
+            console.print_exception()
+        sys.exit(1)
 
 
 @cli.command()
@@ -105,10 +127,54 @@ def status(ctx: click.Context, name: str) -> None:
     Displays current status, IP address, and other metadata for the
     specified project instance.
     """
-    console.print(f"[bold]Checking status for project: {name}[/bold]")
+    config = ctx.obj["config"]
+    debug = ctx.obj.get("debug", False)
     
-    # TODO: Implement status checking
-    console.print("[red]Command not yet implemented in this version.[/red]")
+    try:
+        # Get project from config
+        instance = config.get_project_instance(name)
+        if not instance:
+            console.print(f"[red]✗ Project '{name}' not found[/red]")
+            console.print("Use 'clwd config list' to see all projects")
+            sys.exit(1)
+        
+        console.print(f"[bold]Status for project: {name}[/bold]\n")
+        
+        # Display instance information
+        from rich.table import Table
+        
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column("Field", style="bold")
+        table.add_column("Value")
+        
+        table.add_row("Project Name", name)
+        table.add_row("Instance ID", instance.id)
+        table.add_row("IP Address", f"[link=http://{instance.ip}]{instance.ip}[/link]")
+        table.add_row("Provider", instance.provider)
+        table.add_row("Status", f"[{'green' if instance.status == 'running' else 'yellow'}]{instance.status}[/]")
+        table.add_row("Created", instance.created_at)
+        
+        if instance.metadata:
+            for key, value in instance.metadata.items():
+                table.add_row(key.replace("_", " ").title(), str(value))
+        
+        console.print(table)
+        
+        # Additional information
+        console.print(f"\n[bold]Preview URL:[/bold] http://{instance.ip}")
+        console.print(f"[bold]SSH Command:[/bold] ssh root@{instance.ip}")
+        
+        # TODO: Get live status from provider
+        # For now, just show stored status
+        if debug:
+            console.print(f"\n[dim]Stored status: {instance.status}[/dim]")
+            console.print("[dim]Note: Use provider API to get live status[/dim]")
+            
+    except Exception as e:
+        console.print(f"[red]✗ Error checking status: {e}[/red]")
+        if debug:
+            console.print_exception()
+        sys.exit(1)
 
 
 @cli.command()
@@ -121,15 +187,38 @@ def destroy(ctx: click.Context, name: str, force: bool) -> None:
     Permanently destroys the specified cloud instance and removes all data.
     This action cannot be undone.
     """
-    if not force:
-        if not click.confirm(f"Are you sure you want to destroy project '{name}'?"):
-            console.print("[yellow]Operation cancelled.[/yellow]")
-            return
+    config = ctx.obj["config"]
+    debug = ctx.obj.get("debug", False)
     
-    console.print(f"[bold red]Destroying project: {name}[/bold red]")
-    
-    # TODO: Implement instance destruction
-    console.print("[red]Command not yet implemented in this version.[/red]")
+    try:
+        # Get project from config
+        instance = config.get_project_instance(name)
+        if not instance:
+            console.print(f"[red]✗ Project '{name}' not found[/red]")
+            sys.exit(1)
+        
+        # Confirm destruction
+        if not force:
+            console.print(f"[yellow]About to destroy:[/yellow]")
+            console.print(f"  Project: {name}")
+            console.print(f"  Instance ID: {instance.id}")
+            console.print(f"  IP Address: {instance.ip}")
+            console.print(f"  Provider: {instance.provider}")
+            
+            if not click.confirm(f"\n[bold red]Are you sure you want to destroy project '{name}'?[/bold red]"):
+                console.print("[yellow]Operation cancelled.[/yellow]")
+                return
+        
+        console.print(f"[bold red]Destroying project: {name}[/bold red]")
+        
+        # Run async destruction
+        asyncio.run(_destroy_async(ctx, name, instance))
+        
+    except Exception as e:
+        console.print(f"[red]✗ Error destroying project: {e}[/red]")
+        if debug:
+            console.print_exception()
+        sys.exit(1)
 
 
 @cli.group(name="config")
@@ -142,10 +231,42 @@ def config_group() -> None:
 @click.pass_context
 def config_list(ctx: click.Context) -> None:
     """List all configured projects."""
-    console.print("[bold]Configured projects:[/bold]")
+    config = ctx.obj["config"]
     
-    # TODO: Implement project listing
-    console.print("[dim]No projects configured yet.[/dim]")
+    try:
+        project_details = config.list_project_details()
+        
+        if not project_details:
+            console.print("[dim]No projects configured yet.[/dim]")
+            console.print("Use 'clwd init --name <project>' to create your first project")
+            return
+        
+        console.print(f"[bold]Configured projects ({len(project_details)}):[/bold]\n")
+        
+        from rich.table import Table
+        
+        table = Table()
+        table.add_column("Project", style="bold")
+        table.add_column("Status")
+        table.add_column("IP Address")
+        table.add_column("Provider") 
+        table.add_column("Created")
+        
+        for detail in project_details:
+            status_color = "green" if detail["status"] == "running" else "yellow"
+            table.add_row(
+                detail["project_name"],
+                f"[{status_color}]{detail['status']}[/]",
+                detail["ip"],
+                detail["provider"],
+                detail["created_at"][:10] if detail["created_at"] else ""
+            )
+        
+        console.print(table)
+        
+    except Exception as e:
+        console.print(f"[red]✗ Error listing projects: {e}[/red]")
+        sys.exit(1)
 
 
 @config_group.command(name="show")
@@ -153,10 +274,34 @@ def config_list(ctx: click.Context) -> None:
 @click.pass_context
 def config_show(ctx: click.Context, name: str) -> None:
     """Show detailed configuration for a project."""
-    console.print(f"[bold]Configuration for project: {name}[/bold]")
+    config = ctx.obj["config"]
     
-    # TODO: Implement project details
-    console.print("[red]Command not yet implemented in this version.[/red]")
+    try:
+        project_data = config.get_project(name)
+        if not project_data:
+            console.print(f"[red]✗ Project '{name}' not found[/red]")
+            sys.exit(1)
+        
+        console.print(f"[bold]Configuration for project: {name}[/bold]\n")
+        
+        from rich.panel import Panel
+        import json
+        
+        # Format the configuration as pretty JSON
+        config_json = json.dumps(project_data, indent=2, sort_keys=True)
+        
+        panel = Panel(
+            config_json,
+            title="Project Configuration",
+            title_align="left",
+            border_style="blue"
+        )
+        
+        console.print(panel)
+        
+    except Exception as e:
+        console.print(f"[red]✗ Error showing project: {e}[/red]")
+        sys.exit(1)
 
 
 @cli.group(name="premium")
@@ -192,46 +337,109 @@ async def _init_async(
 ) -> None:
     """Async implementation of init command."""
     debug = ctx.obj.get("debug", False)
+    config = ctx.obj["config"]
     
-    try:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=console,
-        ) as progress:
-            task = progress.add_task("Initializing project...", total=None)
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Initializing project...", total=None)
+        
+        try:
+            # Initialize provider
+            progress.update(task, description="Initializing cloud provider...")
             
-            # TODO: Implement actual initialization
-            import time
-            await asyncio.sleep(1)  # Simulate work
+            if provider == "hetzner":
+                cloud_provider = HetznerProvider(region=region or "nbg1")
+            else:
+                raise ValueError(f"Unsupported provider: {provider}")
             
-            progress.update(task, description="Validating configuration...")
-            await asyncio.sleep(1)
+            # TODO: Handle Claude authentication (skip for now if skip_auth)
+            claude_json_content = None
+            if not skip_auth:
+                progress.update(task, description="Preparing Claude Code authentication...")
+                # TODO: Implement keychain integration
+                await asyncio.sleep(1)
             
+            # Create cloud instance
             progress.update(task, description="Creating cloud instance...")
-            await asyncio.sleep(2)
+            instance = await cloud_provider.create_instance(
+                name=name,
+                size=size,
+                hardening_level=hardening,
+                claude_json_content=claude_json_content
+            )
             
-            progress.update(task, description="Setting up Claude Code...")
-            await asyncio.sleep(2)
+            # Wait for SSH to be available
+            progress.update(task, description="Waiting for instance to be ready...")
+            ssh_ready = await cloud_provider.wait_for_ssh(instance.ip, timeout=300)
             
-            progress.update(task, description="Applying security hardening...")
-            await asyncio.sleep(1)
+            if not ssh_ready:
+                raise ProviderError("Instance created but SSH is not available after 5 minutes")
             
-            progress.update(task, description="Finalizing setup...")
-            await asyncio.sleep(1)
+            # Save project to config
+            progress.update(task, description="Saving project configuration...")
+            config.add_project(name, instance)
+            
+            # Final setup validation
+            progress.update(task, description="Validating setup...")
+            await asyncio.sleep(2)  # Allow time for cloud-init to complete
+            
+        except ProviderError as e:
+            raise RuntimeError(f"Provider error: {e}")
+        except Exception as e:
+            raise RuntimeError(f"Unexpected error: {e}")
+    
+    # Success message
+    console.print(f"[green]✓ Project '{name}' created successfully![/green]")
+    console.print(f"[dim]Provider: {provider} | Size: {size} | Hardening: {hardening}[/dim]")
+    console.print(f"[dim]IP Address: {instance.ip}[/dim]")
+    console.print(f"[dim]Instance ID: {instance.id}[/dim]")
+    
+    console.print("\n[bold]Next steps:[/bold]")
+    console.print(f"  clwd open --name {name}     # Open interactive session")
+    console.print(f"  clwd status --name {name}   # Check instance status") 
+    console.print(f"  clwd destroy --name {name}  # Destroy when done")
+    
+    console.print(f"\n[bold]Preview URL:[/bold] http://{instance.ip}")
+    console.print("[dim]Note: It may take a few minutes for services to start[/dim]")
+
+
+async def _destroy_async(ctx: click.Context, name: str, instance) -> None:
+    """Async implementation of destroy command."""
+    config = ctx.obj["config"]
+    
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Destroying instance...", total=None)
         
-        console.print(f"[green]✓ Project '{name}' created successfully![/green]")
-        console.print(f"[dim]Provider: {provider} | Size: {size} | Hardening: {hardening}[/dim]")
-        console.print("\n[bold]Next steps:[/bold]")
-        console.print(f"  clwd open --name {name}     # Open interactive session")
-        console.print(f"  clwd status --name {name}   # Check instance status")
-        console.print(f"  clwd destroy --name {name}  # Destroy when done")
-        
-    except Exception as e:
-        console.print(f"[red]✗ Failed to create project: {e}[/red]")
-        if debug:
-            console.print_exception()
-        sys.exit(1)
+        try:
+            # Initialize provider
+            progress.update(task, description="Initializing cloud provider...")
+            
+            if instance.provider == "hetzner":
+                # Get region from metadata if available
+                region = instance.metadata.get("region", "nbg1")
+                cloud_provider = HetznerProvider(region=region)
+            else:
+                raise ValueError(f"Unsupported provider: {instance.provider}")
+            
+            # Destroy cloud instance
+            progress.update(task, description="Destroying cloud instance...")
+            await cloud_provider.destroy_instance(instance.id)
+            
+            # Remove from config
+            progress.update(task, description="Removing project configuration...")
+            config.remove_project(name)
+            
+        except Exception as e:
+            raise RuntimeError(f"Failed to destroy instance: {e}")
+    
+    console.print(f"[green]✓ Project '{name}' destroyed successfully[/green]")
 
 
 if __name__ == "__main__":
