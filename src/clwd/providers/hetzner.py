@@ -171,11 +171,26 @@ set -e
 
 # Update system and install base packages
 apt-get update
-apt-get install -y curl wget gnupg2 software-properties-common nginx ufw
+apt-get install -y curl wget gnupg2 software-properties-common nginx ufw sudo
 
-# Create working directory
+# Create claude-user with proper home directory
+useradd -m -s /bin/bash claude-user
+usermod -aG sudo claude-user
+
+# Create working directory and set permissions
 mkdir -p /app
-cd /app"""
+chown claude-user:claude-user /app
+chmod 755 /app
+
+# Set up SSH key access for claude-user (copy from root)
+mkdir -p /home/claude-user/.ssh
+cp /root/.ssh/authorized_keys /home/claude-user/.ssh/authorized_keys
+chown -R claude-user:claude-user /home/claude-user/.ssh
+chmod 700 /home/claude-user/.ssh
+chmod 600 /home/claude-user/.ssh/authorized_keys
+
+# Allow claude-user sudo without password for initial setup
+echo 'claude-user ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/claude-user"""
     
     def _get_nodejs_setup_script(self) -> str:
         """Get Node.js installation script."""
@@ -190,15 +205,34 @@ npm install -g @anthropic-ai/claude-code"""
     def _get_claude_setup_script(self, claude_json_content: Optional[str]) -> str:
         """Get Claude Code authentication setup script."""
         if not claude_json_content:
-            return "# No Claude authentication provided"
+            return """
+# No Claude authentication provided - manual setup required
+echo "# Claude Code authentication not configured" > /app/README.md
+echo "# Run 'claude auth login' to authenticate" >> /app/README.md"""
         
         return f"""
-# Set up Claude Code authentication
-mkdir -p /root/.claude
-cat > /root/.claude.json << 'EOF'
+# Set up Claude Code authentication for claude-user
+mkdir -p /home/claude-user/.claude
+cat > /home/claude-user/.claude.json << 'EOF'
 {claude_json_content}
 EOF
-chmod 600 /root/.claude.json"""
+chown -R claude-user:claude-user /home/claude-user/.claude
+chmod 700 /home/claude-user/.claude
+chmod 644 /home/claude-user/.claude.json
+
+# Create Claude Code settings
+cat > /home/claude-user/.claude/settings.json << 'EOF'
+{{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {{
+    "defaultMode": "acceptEdits"
+  }},
+  "theme": "dark",
+  "autoUpdates": false
+}}
+EOF
+chown claude-user:claude-user /home/claude-user/.claude/settings.json
+chmod 600 /home/claude-user/.claude/settings.json"""
     
     def _get_nginx_setup_script(self) -> str:
         """Get Nginx configuration script."""
@@ -263,35 +297,71 @@ systemctl restart nginx"""
     def _get_hardening_script(self, hardening_level: str) -> str:
         """Get security hardening script based on level."""
         if hardening_level == "none":
-            return "# No security hardening applied"
+            return """
+# Development mode - minimal hardening
+# Keep password authentication enabled for development
+# Allow root login for debugging"""
         elif hardening_level == "minimal":
             return """
-# Minimal security hardening
+# Minimal security hardening - development friendly
 ufw --force enable
 ufw allow ssh
 ufw allow http
 ufw allow https
 
-# Basic SSH hardening
+# Basic SSH hardening but keep development friendly
 sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
+sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+
+# Keep root login for debugging (minimal level)
+# sed -i 's/#PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config
+
+# Enable automatic security updates
+apt-get install -y unattended-upgrades
+echo 'Unattended-Upgrade::Automatic-Reboot "false";' >> /etc/apt/apt.conf.d/50unattended-upgrades
+
 systemctl restart sshd"""
         elif hardening_level == "full":
             return """
-# Full security hardening
+# Full security hardening - production ready
 ufw --force enable
 ufw allow ssh
 ufw allow http  
 ufw allow https
 
-# SSH hardening
+# Comprehensive SSH hardening
 sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
 sed -i 's/#PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config
 sed -i 's/#MaxAuthTries 6/MaxAuthTries 3/' /etc/ssh/sshd_config
+sed -i 's/#MaxSessions 10/MaxSessions 5/' /etc/ssh/sshd_config
+sed -i 's/#ClientAliveInterval 0/ClientAliveInterval 300/' /etc/ssh/sshd_config
+sed -i 's/#ClientAliveCountMax 3/ClientAliveCountMax 2/' /etc/ssh/sshd_config
 
-# Install fail2ban
+# Install and configure fail2ban
 apt-get install -y fail2ban
 systemctl enable fail2ban
+
+# Create fail2ban configuration
+cat > /etc/fail2ban/jail.local << 'EOF'
+[sshd]
+enabled = true
+port = ssh
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 3
+bantime = 3600
+findtime = 600
+EOF
+
 systemctl start fail2ban
+
+# Remove sudo access without password for claude-user (production mode)
+rm -f /etc/sudoers.d/claude-user
+echo 'claude-user ALL=(ALL) ALL' > /etc/sudoers.d/claude-user-secure
+
+# Set up automatic security updates
+apt-get install -y unattended-upgrades
+echo 'Unattended-Upgrade::Automatic-Reboot "false";' >> /etc/apt/apt.conf.d/50unattended-upgrades
 
 systemctl restart sshd"""
         else:
@@ -349,6 +419,11 @@ echo "Setup completed at $(date)" > /var/log/clwd-setup.log"""
             # Generate cloud-init script
             user_data = self._generate_cloud_init_script(name, hardening_level, claude_json_content)
             
+            # Get location object
+            location = self.client.locations.get_by_name(self.region)
+            if not location:
+                raise ProviderError(f"Location not found: {self.region}", provider="hetzner")
+            
             # Create server
             server_name = f"clwd-{name}-{int(time.time())}"
             response = self.client.servers.create(
@@ -357,7 +432,7 @@ echo "Setup completed at $(date)" > /var/log/clwd-setup.log"""
                 image=image,
                 ssh_keys=[ssh_key],
                 user_data=user_data,
-                location=self.region,
+                location=location,
                 labels={
                     "project": name,
                     "managed-by": "clwd",
