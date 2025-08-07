@@ -24,7 +24,7 @@ console = Console()
 def interactive_project_selection(config: Config, action: str = "select", filter_running: bool = False) -> Optional[str]:
     """Interactive project selection with rich display."""
     try:
-        projects = config.list_projects()
+        projects = config.load_projects()
         if not projects:
             console.print("[yellow]No projects found.[/yellow]")
             console.print("Create one with: [cyan]clwd init myproject[/cyan]")
@@ -218,26 +218,35 @@ def ssh(ctx: click.Context, name: str, user: str) -> None:
 
 
 @cli.command()
-@click.option("--name", required=True, help="Project name")
+@click.argument("name", required=False)
+@click.option("--name", help="Project name (alternative to positional argument)")
 @click.pass_context
-def open(ctx: click.Context, name: str) -> None:
+def open(ctx: click.Context, name: Optional[str], **kwargs) -> None:
     """Open an interactive Claude Code session on the cloud instance.
     
     Connects to the cloud instance and starts Claude Code in interactive mode
     in the /app directory, ready for development and conversation.
     """
     config = ctx.obj["config"]
+    
+    # Resolve project name (positional argument takes precedence over --name option)
+    project_name = name or kwargs.get('name')
+    if not project_name:
+        # Show interactive selection
+        project_name = interactive_project_selection(config, "open")
+        if not project_name:
+            sys.exit(0)  # User cancelled or no projects
     debug = ctx.obj.get("debug", False)
     
     try:
         # Get project from config
-        instance = config.get_project_instance(name)
+        instance = config.get_project_instance(project_name)
         if not instance:
-            console.print(f"[red]✗ Project '{name}' not found[/red]")
+            console.print(f"[red]✗ Project '{project_name}' not found[/red]")
             console.print("Use 'clwd config list' to see all projects")
             sys.exit(1)
         
-        console.print(f"[bold]Opening Claude Code interactive session for project: {name}[/bold]")
+        console.print(f"[bold]Opening Claude Code interactive session for project: {project_name}[/bold]")
         console.print(f"[dim]Connecting to claude-user@{instance.ip}...[/dim]")
         
         # Get SSH session for claude-user
